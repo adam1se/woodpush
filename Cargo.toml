@@ -1,0 +1,12 @@
+[package]
+name = "project"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.31"
+chess = "3.2.0"
+image = { version = "0.25", default-features = false, features = ["webp"] }
+[[bin]]
+name = "woodpush"
+path = "main.rs"
