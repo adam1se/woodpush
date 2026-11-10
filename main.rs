@@ -1,7 +1,4 @@
-use chess::{
-    Board, BoardStatus, ChessMove, Color, File, MoveGen,
-    Piece, Rank, Square,
-};
+use chess::{Board, BoardStatus, ChessMove, Color, File, MoveGen, Piece, Rank, Square};
 
 use eframe::egui;
 
@@ -23,6 +20,10 @@ struct Woodpush {
     textures: HashMap<String, egui::TextureHandle>,
     engine_receiver: Option<Receiver<Result<ChessMove, String>>>,
     engine_thinking: bool,
+
+    // Физика наклона
+    tilt: egui::Vec2,
+    last_pointer_pos: Option<egui::Pos2>,
 }
 
 impl Woodpush {
@@ -55,43 +56,27 @@ impl Woodpush {
                 Ok(img) => {
                     let rgba = img.to_rgba8();
 
-                    let size = [
-                        rgba.width() as usize,
-                        rgba.height() as usize,
-                    ];
+                    let size = [rgba.width() as usize, rgba.height() as usize];
 
-                    let color_image =
-                        egui::ColorImage::from_rgba_unmultiplied(
-                            size,
-                            rgba.as_raw(),
-                        );
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
 
-                    let texture = cc.egui_ctx.load_texture(
-                        name,
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    );
+                    let texture =
+                        cc.egui_ctx
+                            .load_texture(name, color_image, egui::TextureOptions::LINEAR);
 
                     textures.insert(name.to_string(), texture);
                 }
 
                 Err(error) => {
-                    load_errors.push(format!(
-                        "{}: {}",
-                        path.display(),
-                        error
-                    ));
+                    load_errors.push(format!("{}: {}", path.display(), error));
                 }
             }
         }
 
         let message = if load_errors.is_empty() {
-            "Все шахматные фигуры загружены.".to_string()
+            "All pieces loaded.".to_string()
         } else {
-            format!(
-                "Не удалось загрузить некоторые фигуры:\n{}",
-                load_errors.join("\n")
-            )
+            format!("Failed to load some pieces:\n{}", load_errors.join("\n"))
         };
 
         Self {
@@ -99,11 +84,14 @@ impl Woodpush {
             selected: None,
             message,
             engine_path: PathBuf::from(
-                "C:\\Users\\User\\Desktop\\project\\stockfish-windows-x86-64-universal.exe"
+                "C:\\Users\\User\\Desktop\\project\\stockfish-windows-x86-64-universal.exe",
             ),
             textures,
             engine_receiver: None,
             engine_thinking: false,
+
+            tilt: egui::Vec2::ZERO,
+            last_pointer_pos: None,
         }
     }
 
@@ -129,21 +117,19 @@ impl Woodpush {
         match self.board.status() {
             BoardStatus::Checkmate => {
                 if self.board.side_to_move() == Color::White {
-                    "Мат! Победил Stockfish".to_string()
+                    "Checkmate! Stockfish wins.".to_string()
                 } else {
-                    "Мат! Победили белые".to_string()
+                    "Checkmate! You win.".to_string()
                 }
             }
 
-            BoardStatus::Stalemate => {
-                "Ничья — пат".to_string()
-            }
+            BoardStatus::Stalemate => "Stalemate — draw".to_string(),
 
             BoardStatus::Ongoing => {
                 if self.board.side_to_move() == Color::White {
-                    "Ваш ход".to_string()
+                    "Your move".to_string()
                 } else {
-                    "Ход Stockfish".to_string()
+                    "Stockfish's turn".to_string()
                 }
             }
         }
@@ -158,14 +144,15 @@ impl Woodpush {
         self.board = Board::default();
         self.selected = None;
 
-        // Отбрасываем ответ предыдущей партии.
         self.engine_receiver = None;
         self.engine_thinking = false;
 
-        self.message = "Новая партия. Ваш ход.".to_string();
+        self.tilt = egui::Vec2::ZERO;
+        self.last_pointer_pos = None;
+
+        self.message = "New game. Your move.".to_string();
     }
 
-    // Запуск Stockfish в отдельном потоке.
     fn engine_move(&mut self) {
         if self.board.status() != BoardStatus::Ongoing {
             return;
@@ -179,7 +166,7 @@ impl Woodpush {
             return;
         }
 
-        self.message = "Stockfish думает...".to_string();
+        self.message = "Stockfish is thinking...".to_string();
         self.engine_thinking = true;
 
         let board = self.board;
@@ -195,7 +182,6 @@ impl Woodpush {
         });
     }
 
-    // Получение результата от Stockfish.
     fn poll_engine(&mut self) {
         let result = match self.engine_receiver.as_ref() {
             Some(receiver) => match receiver.try_recv() {
@@ -204,9 +190,7 @@ impl Woodpush {
                 Err(TryRecvError::Empty) => None,
 
                 Err(TryRecvError::Disconnected) => {
-                    Some(Err(
-                        "Поток Stockfish завершился.".to_string()
-                    ))
+                    Some(Err("Stockfish thread disconnected.".to_string()))
                 }
             },
 
@@ -219,49 +203,32 @@ impl Woodpush {
 
             match result {
                 Ok(chess_move) => {
-                    if MoveGen::new_legal(&self.board)
-                        .any(|m| m == chess_move)
-                    {
+                    if MoveGen::new_legal(&self.board).any(|m| m == chess_move) {
                         self.make_move(chess_move);
                         self.message = self.status_text();
                     } else {
-                        self.message =
-                            "Stockfish вернул нелегальный ход.".to_string();
+                        self.message = "Stockfish returned an illegal move.".to_string();
                     }
                 }
 
                 Err(error) => {
-                    self.message = format!(
-                        "Ошибка Stockfish: {}",
-                        error
-                    );
+                    self.message = format!("Error with Stockfish: {}", error);
                 }
             }
         }
     }
 
-    // Запрос хода у движка.
-    fn ask_stockfish(
-        board: Board,
-        engine_path: &PathBuf,
-    ) -> Result<ChessMove, String> {
+    fn ask_stockfish(board: Board, engine_path: &PathBuf) -> Result<ChessMove, String> {
         let mut child = Command::new(engine_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| {
-                format!(
-                    "Не удалось запустить движок: {}. Проверь Stockfish.",
-                    e
-                )
-            })?;
+            .map_err(|e| format!("Cant start engine: {}. Check Stockfish path.", e))?;
 
-        let mut input = child.stdin.take()
-            .ok_or("Не удалось открыть stdin Stockfish")?;
+        let mut input = child.stdin.take().ok_or("Cant open stdin Stockfish")?;
 
-        let output = child.stdout.take()
-            .ok_or("Не удалось открыть stdout Stockfish")?;
+        let output = child.stdout.take().ok_or("Cant open stdout Stockfish")?;
 
         let mut reader = BufReader::new(output);
         let mut line = String::new();
@@ -273,7 +240,7 @@ impl Woodpush {
             line.clear();
 
             if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-                return Err("Stockfish завершил работу.".to_string());
+                return Err("Stockfish terminated.".to_string());
             }
 
             if line.trim() == "uciok" {
@@ -288,7 +255,7 @@ impl Woodpush {
             line.clear();
 
             if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-                return Err("Stockfish не ответил.".to_string());
+                return Err("Stockfish did not respond.".to_string());
             }
 
             if line.trim() == "readyok" {
@@ -296,11 +263,9 @@ impl Woodpush {
             }
         }
 
-        writeln!(input, "position fen {}", board)
-            .map_err(|e| e.to_string())?;
+        writeln!(input, "position fen {}", board).map_err(|e| e.to_string())?;
 
-        writeln!(input, "go movetime 1000")
-            .map_err(|e| e.to_string())?;
+        writeln!(input, "go movetime 1000").map_err(|e| e.to_string())?;
 
         input.flush().map_err(|e| e.to_string())?;
 
@@ -308,14 +273,15 @@ impl Woodpush {
             line.clear();
 
             if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-                return Err("Нет ответа bestmove.".to_string());
+                return Err("No response from Stockfish.".to_string());
             }
 
             let parts: Vec<&str> = line.split_whitespace().collect();
 
             if parts.first() == Some(&"bestmove") {
-                break parts.get(1)
-                    .ok_or("Stockfish не вернул ход")?
+                break parts
+                    .get(1)
+                    .ok_or("Stockfish did not return a valid move.")?
                     .to_string();
             }
         };
@@ -325,18 +291,18 @@ impl Woodpush {
         let _ = child.wait();
 
         if best_move == "(none)" || best_move == "0000" {
-            return Err("Нет доступных ходов.".to_string());
+            return Err("No valid moves available.".to_string());
         }
 
         if best_move.len() < 4 {
-            return Err("Некорректный формат хода.".to_string());
+            return Err("Invalid move format.".to_string());
         }
 
-        let from = Square::from_str(&best_move[0..2])
-            .map_err(|_| "Некорректная начальная клетка")?;
+        let from =
+            Square::from_str(&best_move[0..2]).map_err(|_| "Invalid source square".to_string())?;
 
         let to = Square::from_str(&best_move[2..4])
-            .map_err(|_| "Некорректная конечная клетка")?;
+            .map_err(|_| "Invalid destination square".to_string())?;
 
         let promotion = if best_move.len() >= 5 {
             match &best_move[4..5] {
@@ -346,9 +312,7 @@ impl Woodpush {
                 "n" => Some(Piece::Knight),
 
                 _ => {
-                    return Err(
-                        "Некорректное превращение пешки".to_string()
-                    );
+                    return Err("Invalid pawn promotion".to_string());
                 }
             }
         } else {
@@ -369,24 +333,17 @@ impl Woodpush {
 
         if let Some(from) = self.selected {
             let found = MoveGen::new_legal(&self.board)
-                .find(|m| {
-                    m.get_source() == from
-                        && m.get_dest() == square
-                });
+                .find(|m| m.get_source() == from && m.get_dest() == square);
 
             if let Some(mut chess_move) = found {
                 if self.board.piece_on(from) == Some(Piece::Pawn)
                     && square.get_rank() == Rank::Eighth
                 {
-                    chess_move = ChessMove::new(
-                        from,
-                        square,
-                        Some(Piece::Queen),
-                    );
+                    chess_move = ChessMove::new(from, square, Some(Piece::Queen));
                 }
 
                 self.make_move(chess_move);
-                self.message = "Ход сделан.".to_string();
+                self.message = "Move made.".to_string();
 
                 self.engine_move();
 
@@ -401,11 +358,7 @@ impl Woodpush {
         }
     }
 
-    // Определение клетки под курсором.
-    fn square_from_pos(
-        rect: egui::Rect,
-        pos: egui::Pos2,
-    ) -> Option<Square> {
+    fn square_from_pos(rect: egui::Rect, pos: egui::Pos2) -> Option<Square> {
         if !rect.contains(pos) {
             return None;
         }
@@ -425,10 +378,8 @@ impl Woodpush {
         ))
     }
 
-    // Отрисовка шахматной доски с Drag & Drop.
     fn draw_board(&mut self, ui: &mut egui::Ui) {
-        let legal_moves: Vec<ChessMove> =
-            MoveGen::new_legal(&self.board).collect();
+        let legal_moves: Vec<ChessMove> = MoveGen::new_legal(&self.board).collect();
 
         let selected = self.selected;
         let board_size = 512.0;
@@ -444,14 +395,42 @@ impl Woodpush {
 
         let dragging = response.dragged();
 
+        // Расчёт физики наклона
+        let dt = ui.input(|i| i.unstable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
+
+        let mut target_tilt = egui::Vec2::ZERO;
+
+        if dragging {
+            if let Some(pos) = pointer_pos {
+                if let Some(last_pos) = self.last_pointer_pos {
+                    let velocity = (pos - last_pos) / dt;
+
+                    target_tilt = egui::vec2(
+                        (velocity.x / 900.0).clamp(-1.0, 1.0),
+                        (velocity.y / 900.0).clamp(-1.0, 1.0),
+                    );
+                }
+
+                self.last_pointer_pos = Some(pos);
+            }
+        } else {
+            self.last_pointer_pos = None;
+        }
+
+        // Плавная инерция
+        let smoothing = 1.0 - (-dt * 14.0).exp();
+
+        self.tilt += (target_tilt - self.tilt) * smoothing;
+
+        if dragging || self.tilt.length() > 0.005 {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+
         let painter = ui.painter();
 
         for row in 0..8 {
             for col in 0..8 {
-                let square = Square::make_square(
-                    Rank::from_index(7 - row),
-                    File::from_index(col),
-                );
+                let square = Square::make_square(Rank::from_index(7 - row), File::from_index(col));
 
                 let light = (row + col) % 2 == 0;
 
@@ -462,63 +441,43 @@ impl Woodpush {
                 };
 
                 if selected == Some(square) {
-                    color = egui::Color32::from_rgb(
-                        246, 246, 105
-                    );
+                    color = egui::Color32::from_rgb(246, 246, 105);
                 }
 
                 let cell_rect = egui::Rect::from_min_size(
-                    rect.min + egui::vec2(
-                        col as f32 * cell_size,
-                        row as f32 * cell_size,
-                    ),
+                    rect.min + egui::vec2(col as f32 * cell_size, row as f32 * cell_size),
                     egui::vec2(cell_size, cell_size),
                 );
 
                 painter.rect_filled(cell_rect, 0.0, color);
 
-                // Подсветка доступных ходов.
                 if let Some(from) = selected {
-                    if legal_moves.iter().any(|m| {
-                        m.get_source() == from
-                            && m.get_dest() == square
-                    }) {
+                    if legal_moves
+                        .iter()
+                        .any(|m| m.get_source() == from && m.get_dest() == square)
+                    {
                         painter.circle_filled(
                             cell_rect.center(),
                             9.0,
-                            egui::Color32::from_rgba_unmultiplied(
-                                30, 30, 30, 110
-                            ),
+                            egui::Color32::from_rgba_unmultiplied(30, 30, 30, 110),
                         );
                     }
                 }
 
                 if let Some(piece) = self.board.piece_on(square) {
-                    let piece_color =
-                        self.board.color_on(square).unwrap();
+                    let piece_color = self.board.color_on(square).unwrap();
 
-                    let filename = Self::piece_filename(
-                        piece,
-                        piece_color,
-                    );
+                    let filename = Self::piece_filename(piece, piece_color);
 
-                    // Во время перетаскивания прячем фигуру
-                    // на исходной клетке.
-                    let hide_source = dragging
-                        && selected == Some(square);
+                    let hide_source = dragging && selected == Some(square);
 
                     if !hide_source {
-                        if let Some(texture) =
-                            self.textures.get(filename)
-                        {
-                            painter.image(
-                                texture.id(),
+                        if let Some(texture) = self.textures.get(filename) {
+                            Self::draw_tilted_piece(
+                                painter,
+                                texture,
                                 cell_rect.shrink(4.0),
-                                egui::Rect::from_min_max(
-                                    egui::Pos2::ZERO,
-                                    egui::Pos2::new(1.0, 1.0),
-                                ),
-                                egui::Color32::WHITE,
+                                egui::Vec2::ZERO,
                             );
                         }
                     }
@@ -526,44 +485,26 @@ impl Woodpush {
             }
         }
 
-        // Рисуем фигуру под курсором.
+        // Плавающая фигура при перетаскивании
         if dragging {
             if let (Some(square), Some(pos)) = (selected, pointer_pos) {
                 if let Some(piece) = self.board.piece_on(square) {
-                    if let Some(piece_color) =
-                        self.board.color_on(square)
-                    {
-                        let filename =
-                            Self::piece_filename(piece, piece_color);
+                    if let Some(piece_color) = self.board.color_on(square) {
+                        let filename = Self::piece_filename(piece, piece_color);
 
-                        if let Some(texture) =
-                            self.textures.get(filename)
-                        {
-                            let floating_rect =
-                                egui::Rect::from_center_size(
-                                    pos,
-                                    egui::vec2(
-                                        cell_size * 0.95,
-                                        cell_size * 0.95,
-                                    ),
-                                );
-
-                            painter.image(
-                                texture.id(),
-                                floating_rect,
-                                egui::Rect::from_min_max(
-                                    egui::Pos2::ZERO,
-                                    egui::Pos2::new(1.0, 1.0),
-                                ),
-                                egui::Color32::WHITE,
+                        if let Some(texture) = self.textures.get(filename) {
+                            let floating_rect = egui::Rect::from_center_size(
+                                pos,
+                                egui::vec2(cell_size * 0.95, cell_size * 0.95),
                             );
+
+                            Self::draw_tilted_piece(painter, texture, floating_rect, self.tilt);
                         }
                     }
                 }
             }
         }
 
-        // Начало перетаскивания.
         if response.drag_started() {
             if let Some(pos) = pointer_pos {
                 if let Some(square) = Self::square_from_pos(rect, pos) {
@@ -571,12 +512,12 @@ impl Woodpush {
                         && self.board.side_to_move() == Color::White
                     {
                         self.selected = Some(square);
+                        self.last_pointer_pos = Some(pos);
                     }
                 }
             }
         }
 
-        // Отпускание фигуры.
         if response.drag_stopped() {
             if let Some(pos) = pointer_pos {
                 if let Some(square) = Self::square_from_pos(rect, pos) {
@@ -585,9 +526,10 @@ impl Woodpush {
                     self.selected = None;
                 }
             }
+
+            self.last_pointer_pos = None;
         }
 
-        // Обычные клики.
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some(square) = Self::square_from_pos(rect, pos) {
@@ -596,22 +538,55 @@ impl Woodpush {
             }
         }
     }
+
+    // 2D-деформация текстуры фигуры
+    fn draw_tilted_piece(
+        painter: &egui::Painter,
+        texture: &egui::TextureHandle,
+        rect: egui::Rect,
+        tilt: egui::Vec2,
+    ) {
+        let center = rect.center();
+
+        let shear_x = tilt.x * 0.22;
+        let shear_y = tilt.y * 0.22;
+
+        let corners = [
+            (rect.left_top(), egui::pos2(0.0, 0.0)),
+            (rect.right_top(), egui::pos2(1.0, 0.0)),
+            (rect.right_bottom(), egui::pos2(1.0, 1.0)),
+            (rect.left_bottom(), egui::pos2(0.0, 1.0)),
+        ];
+
+        let mut mesh = egui::epaint::Mesh::with_texture(texture.id());
+
+        for (position, uv) in corners {
+            let local = position - center;
+
+            let transformed = egui::pos2(
+                center.x + local.x - shear_x * local.y,
+                center.y + local.y - shear_y * local.x,
+            );
+
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: transformed,
+                uv,
+                color: egui::Color32::WHITE,
+            });
+        }
+
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+
+        painter.add(mesh);
+    }
 }
 
 impl eframe::App for Woodpush {
-    fn update(
-        &mut self,
-        ctx: &egui::Context,
-        _frame: &mut eframe::Frame,
-    ) {
-        // Проверяем, ответил ли Stockfish.
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_engine();
 
-        // Обновляем интерфейс во время расчёта движка.
         if self.engine_thinking {
-            ctx.request_repaint_after(
-                Duration::from_millis(16)
-            );
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -630,7 +605,7 @@ impl eframe::App for Woodpush {
 
                     ui.add_space(12.0);
 
-                    if ui.button("Новая партия").clicked() {
+                    if ui.button("New game").clicked() {
                         self.restart();
                     }
                 });
@@ -638,41 +613,41 @@ impl eframe::App for Woodpush {
                 ui.add_space(20.0);
 
                 ui.vertical(|ui| {
-                    ui.heading("Партия");
+                    ui.heading("Game");
                     ui.separator();
 
                     ui.label(format!(
-                        "Ход: {}",
+                        "Turn: {}",
                         if self.board.side_to_move() == Color::White {
-                            "Белые"
+                            "White"
                         } else {
-                            "Чёрные"
+                            "Black"
                         }
                     ));
 
                     ui.add_space(12.0);
 
-                    ui.label("Соперник:");
+                    ui.label("Opponent:");
                     ui.strong("Stockfish");
 
                     ui.add_space(12.0);
 
-                    ui.label("Время на ход:");
-                    ui.strong("1 секунда");
+                    ui.label("Time per move:");
+                    ui.strong("1 second");
 
                     ui.add_space(20.0);
 
-                    ui.label("Состояние:");
+                    ui.label("State:");
                     ui.label(self.status_text());
 
                     ui.add_space(12.0);
 
-                    ui.label("Сообщение:");
+                    ui.label("Message:");
 
                     if self.engine_thinking {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label("Stockfish анализирует позицию...");
+                            ui.label("Stockfish is thinking...");
                         });
                     } else {
                         ui.label(&self.message);
@@ -680,7 +655,7 @@ impl eframe::App for Woodpush {
 
                     ui.add_space(20.0);
 
-                    if ui.button("Перезапустить").clicked() {
+                    if ui.button("Restart").clicked() {
                         self.restart();
                     }
                 });
